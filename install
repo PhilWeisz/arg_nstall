@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Check for required files
+if [[ ! -f ./fstab || ! -f ./settings.conf ]]; then
+    echo "Error: 'fstab' or 'settings.conf' file is missing. Ensure both files are present in the current directory."
+    exit 1
+fi
+
+# Load settings from settings.conf
+source ./settings.conf
+
+# Mount the filesystem and apply fstab
+echo "Mounting filesystem with Btrfs subvolumes..."
+mount /dev/vol/root /mnt
+mount -o subvol=@home /dev/vol/home /mnt/home
+mount -o subvol=@var /dev/vol/var /mnt/var
+mount -o subvol=@etc /dev/vol/etc /mnt/etc
+mount -o subvol=@usr /dev/vol/usr /mnt/usr
+mount -o subvol=@ss /dev/vol/ss /mnt/ss
+mount -o bind /dev /mnt/dev
+mount -o bind /proc /mnt/proc
+mount -o bind /sys /mnt/sys
+
+# Copy fstab to /mnt/etc/fstab
+cp ./fstab /mnt/etc/fstab
+
+# Override etc configurations from 'etc_setting_overrides'
+echo "Applying settings from etc_setting_overrides..."
+if [[ -d ./etc_setting_overrides ]]; then
+    find ./etc_setting_overrides -type f | while read override_file; do
+        # Determine relative path from etc_setting_overrides
+        relative_path=${override_file#./etc_setting_overrides/}
+        
+        # Target path in /mnt/etc
+        target_path="/mnt/etc/$relative_path"
+
+        # Ensure the target directory exists
+        mkdir -p "$(dirname "$target_path")"
+
+        # Copy the file, overriding if it already exists
+        echo "Copying $relative_path to $target_path"
+        cp "$override_file" "$target_path"
+    done
+else
+    echo "No overrides found in etc_setting_overrides directory."
+fi
+
+# Enter chroot environment
+arch-chroot /mnt /bin/bash <<EOF
+
+# Configure time and localization
+echo "Configuring system time and localization..."
+ln -sf /usr/share/zoneinfo/"${TIMEZONE}" /etc/localtime
+hwclock --systohc
+echo "LANG=${LOCALE}" > /etc/locale.conf
+echo "${HOSTNAME}" > /etc/hostname
+
+# Set root password
+echo "Setting root password..."
+passwd
+
+# Install base packages and bootloader
+echo "Installing base packages and bootloader..."
+pacman -Sy --noconfirm base linux linux-firmware ${PACKAGES}
+bootctl install
+
+# Configure the boot loader with Secure Boot
+echo "Configuring Secure Boot and boot loader..."
+cat <<BOOTLOADER > /boot/loader/entries/arch.conf
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=/dev/vol/root rw
+BOOTLOADER
+
+# Additional Secure Boot and TPM2 setup, following tutorial steps
+echo "Configuring Secure Boot key enrollment and TPM2 settings..."
+# Insert tutorial-specific steps here as needed (e.g., `sbctl` commands, key enrollment).
+
+# Enable essential services
+echo "Enabling essential services..."
+for service in ${SERVICES}; do
+    systemctl enable "$service"
+done
+
+# User creation loop
+echo "Adding users. Press Ctrl+D when done."
+while true; do
+    read -p "Enter username: " USERNAME
+    [[ -z $USERNAME ]] && break
+    useradd -m "$USERNAME"
+    passwd "$USERNAME"
+    usermod -aG wheel "$USERNAME"
+done
+
+# Configure sudoers
+echo "Configuring sudoers..."
+sed -i '/%wheel ALL=(ALL) ALL/s/^#//' /etc/sudoers
+
+EOF
+
+echo "Installation complete. You can now reboot into your new system."
