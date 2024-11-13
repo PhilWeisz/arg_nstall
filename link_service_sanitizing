@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+import os
+import shutil
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+def check_root():
+    """Ensure the script is run as root."""
+    if os.geteuid() != 0:
+        print("This script must be run as root. Please use sudo or switch to the root user.")
+        sys.exit(1)
+
+def find_main_dir(app_name):
+    """Attempt to find the main directory of the application."""
+    # Common directories where applications might be installed
+    common_paths = [
+        '/opt',
+        '/usr/local',
+        '/usr/share',
+        '/var/lib',
+        '/etc'
+    ]
+    for path in common_paths:
+        potential_path = os.path.join(path, app_name)
+        if os.path.isdir(potential_path):
+            return potential_path
+    return None
+
+def discover_services(app_name):
+    """
+    Discover systemd services related to the application name.
+    It searches for services where the service name contains the app name.
+    """
+    try:
+        # Get a list of all service unit files
+        result = subprocess.run(['systemctl', 'list-unit-files', '--type=service', '--no-pager', '--no-legend'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        services = []
+        for line in result.stdout.splitlines():
+            unit, state = line.split()
+            # Check if the app_name is in the unit name (case-insensitive)
+            if app_name.lower() in unit.lower():
+                services.append(unit)
+        if not services:
+            print(f"No services found matching the application name '{app_name}'.")
+        else:
+            print(f"Discovered services related to '{app_name}': {', '.join(services)}")
+        return services
+    except subprocess.CalledProcessError as e:
+        print(f"Error discovering services: {e.stderr}")
+        sys.exit(1)
+
+def save_symlink_info(symlink_info, dest_symlink_info_file):
+    """Save symlink information to a JSON file."""
+    with open(dest_symlink_info_file, 'w') as f:
+        json.dump(symlink_info, f, indent=4)
+    print(f"Symlink information saved to {dest_symlink_info_file}")
+
+def copy_cfgs(src_cfgs, dest_cfgs, symlink_info):
+    """Recursively copy cfgs directory, handling symlinks."""
+    for root, dirs, files in os.walk(src_cfgs):
+        # Compute the relative path from src_cfgs
+        rel_path = os.path.relpath(root, src_cfgs)
+        # Compute the destination directory path
+        dest_dir = os.path.join(dest_cfgs, rel_path)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        for file in files:
+            src_file_path = os.path.join(root, file)
+            dest_file_path = os.path.join(dest_dir, file)
+
+            if os.path.islink(src_file_path):
+                # It's a symlink; save its info
+                link_target = os.readlink(src_file_path)
+                symlink_info[os.path.relpath(src_file_path, src_cfgs)] = link_target
+
+                # Resolve the actual file the symlink points to
+                actual_path = os.path.realpath(src_file_path)
+                if os.path.isfile(actual_path):
+                    shutil.copy2(actual_path, dest_file_path)
+                    print(f"Copied file from symlink: {src_file_path} -> {dest_file_path}")
+                elif os.path.isdir(actual_path):
+                    shutil.copytree(actual_path, dest_file_path, dirs_exist_ok=True)
+                    print(f"Copied directory from symlink: {src_file_path} -> {dest_file_path}")
+                else:
+                    print(f"Symlink {src_file_path} points to unknown type: {actual_path}")
+            else:
+                # Regular file; copy normally
+                shutil.copy2(src_file_path, dest_file_path)
+                print(f"Copied file: {src_file_path} -> {dest_file_path}")
+
+def recreate_symlinks(dest_cfgs, symlink_info_file):
+    """Recreate symlinks in the destination directory based on saved symlink info."""
+    if not os.path.exists(symlink_info_file):
+        print(f"Symlink info file '{symlink_info_file}' does not exist. Skipping symlink recreation.")
+        return
+
+    with open(symlink_info_file, 'r') as f:
+        symlink_info = json.load(f)
+
+    for rel_path, target in symlink_info.items():
+        symlink_path = os.path.join(dest_cfgs, rel_path)
+        symlink_dir = os.path.dirname(symlink_path)
+        os.makedirs(symlink_dir, exist_ok=True)
+
+        # Remove the copied file/directory to replace with symlink
+        if os.path.exists(symlink_path):
+            if os.path.isdir(symlink_path) and not os.path.islink(symlink_path):
+                shutil.rmtree(symlink_path)
+            else:
+                os.remove(symlink_path)
+
+        # Create the symlink
+        try:
+            os.symlink(target, symlink_path)
+            print(f"Recreated symlink: {symlink_path} -> {target}")
+        except OSError as e:
+            print(f"Failed to recreate symlink {symlink_path} -> {target}: {e}")
+
+def handle_tunables(cfgs_dir):
+    """Placeholder for scanning and handling tunables."""
+    # Implement your logic here based on what "tunables" refers to in your context
+    print("Scanning for active tunables... (This is a placeholder)")
+    # Example: List all configuration files
+    for root, dirs, files in os.walk(cfgs_dir):
+        for file in files:
+            print(f"Found configuration file: {os.path.join(root, file)}")
+    # Add actual tunable handling logic here
+
+def stop_services(services):
+    """Stop the specified services."""
+    for service in services:
+        print(f"Stopping service: {service}")
+        try:
+            subprocess.run(['systemctl', 'stop', service], check=True)
+            print(f"Successfully stopped {service}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to stop service {service}: {e}")
+            sys.exit(1)
+
+def start_services(services):
+    """Start the specified services."""
+    for service in services:
+        print(f"Starting service: {service}")
+        try:
+            subprocess.run(['systemctl', 'start', service], check=True)
+            print(f"Successfully started {service}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to start service {service}: {e}")
+            sys.exit(1)
+
+def main():
+    check_root()  # Ensure the script is run as root
+
+    parser = argparse.ArgumentParser(description="Recursive copy of cfgs with symlink and service handling.")
+    parser.add_argument('app_name', help="Name of the application.")
+    parser.add_argument('--dir', help="Specify the directory directly if main directory is not found.", default=None)
+    parser.add_argument('--dest', help="Destination directory for the copied cfgs.", required=True)
+    parser.add_argument('--symlink-info', help="File to save symlink information.", default='symlink_info.json')
+
+    args = parser.parse_args()
+
+    app_dir = args.dir
+    if not app_dir:
+        app_dir = find_main_dir(args.app_name)
+        if not app_dir:
+            print(f"Main directory for app '{args.app_name}' not found. Please specify the directory using --dir.")
+            sys.exit(1)
+        else:
+            print(f"Found main directory for app '{args.app_name}': {app_dir}")
+
+    etc_dir = os.path.join(app_dir, 'etc')
+    if not os.path.isdir(etc_dir):
+        print(f"'etc' directory not found in {app_dir}.")
+        sys.exit(1)
+
+    cfgs_dir = os.path.join(etc_dir, 'cfgs')
+    if not os.path.isdir(cfgs_dir):
+        print(f"'cfgs' directory not found in {etc_dir}.")
+        sys.exit(1)
+
+    dest_cfgs = args.dest
+    os.makedirs(dest_cfgs, exist_ok=True)
+
+    # Discover services related to the application
+    services = discover_services(args.app_name)
+    if not services:
+        print("No services to manage. Exiting.")
+        sys.exit(0)
+
+    symlink_info = {}
+
+    try:
+        # Stop discovered services before copying
+        stop_services(services)
+
+        # Perform the copy
+        copy_cfgs(cfgs_dir, dest_cfgs, symlink_info)
+        save_symlink_info(symlink_info, args.symlink_info)
+
+        # Handle tunables (if applicable)
+        handle_tunables(cfgs_dir)
+
+        # Recreate symlinks in the destination
+        recreate_symlinks(dest_cfgs, args.symlink_info)
+
+    except Exception as e:
+        print(f"An error occurred during the copy process: {e}")
+        print("Attempting to restart services before exiting.")
+        start_services(services)
+        sys.exit(1)
+    finally:
+        # Restart discovered services after copying and symlink recreation
+        start_services(services)
+
+    print("Copy operation and symlink recreation completed successfully.")
+
+if __name__ == "__main__":
+    main()
